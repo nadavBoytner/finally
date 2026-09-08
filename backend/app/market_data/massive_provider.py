@@ -13,31 +13,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_SECONDS = 15.0
 MAX_TICKERS_PER_REQUEST = 100  # keeps the ?tickers= query string well under URL limits
-MAX_BACKOFF_SECONDS = 120.0
 
 
 class MassivePlanError(RuntimeError):
     """The key cannot reach snapshot data — bad key, or a free-tier plan."""
-
-
-def _status_code(exc: BaseException) -> int | None:
-    """Best-effort HTTP status extraction; the client wraps httpx errors."""
-    for attr in ("status", "status_code"):
-        code = getattr(exc, attr, None)
-        if isinstance(code, int):
-            return code
-    response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
-    return code if isinstance(code, int) else None
-
-
-def _retry_after(exc: BaseException) -> float | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) or {}
-    try:
-        return float(headers.get("Retry-After"))
-    except (TypeError, ValueError):
-        return None
 
 
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
@@ -100,11 +79,24 @@ class MassiveProvider(MarketDataProvider):
             ) from exc
 
     async def _fetch(self, tickers: Sequence[str]) -> list[Row]:
+        """Fetch every chunk, keeping rows already parsed even if a later
+        chunk fails. The `massive` client's own errors (`BadResponse`,
+        `AuthError`) carry no HTTP status — see MARKET_DATA_REVIEW.md
+        Finding 1 — so a failed chunk is just logged and skipped rather
+        than losing chunks that already succeeded."""
         rows: list[Row] = []
         for chunk in _chunks(tickers, MAX_TICKERS_PER_REQUEST):
-            snaps = await asyncio.to_thread(
-                self._client.get_snapshot_all, "stocks", tickers=list(chunk)
-            )
+            try:
+                snaps = await asyncio.to_thread(
+                    self._client.get_snapshot_all, "stocks", tickers=list(chunk)
+                )
+            except Exception:
+                logger.warning(
+                    "Massive snapshot request failed for %d ticker(s); skipping",
+                    len(chunk),
+                    exc_info=True,
+                )
+                continue
             for snap in snaps or ():
                 row = parse_snapshot(snap)
                 if row is not None:
@@ -112,32 +104,12 @@ class MassiveProvider(MarketDataProvider):
         return rows
 
     async def run(self, cache: PriceCache, tracked: Tracked) -> None:
-        backoff = 0.0
         while True:
             tickers = sorted(tracked())
-            if not tickers:
-                await asyncio.sleep(self._poll_seconds)
-                continue
-
-            try:
+            if tickers:
                 rows = await self._fetch(tickers)
-            except Exception as exc:
-                if _status_code(exc) == 429:
-                    wait = _retry_after(exc)
-                    if wait is None:
-                        backoff = min(
-                            max(backoff * 2.0, self._poll_seconds), MAX_BACKOFF_SECONDS
-                        )
-                        wait = backoff
-                    logger.warning("Massive rate-limited (429); backing off %.1fs", wait)
-                    await asyncio.sleep(wait)
-                    continue
-                logger.warning("Massive poll failed; retrying next cycle", exc_info=True)
-            else:
-                backoff = 0.0
                 if rows:
                     await cache.update_many(rows)
-
             await asyncio.sleep(self._poll_seconds)
 
     async def prime(self, cache: PriceCache, ticker: str) -> PriceTick | None:

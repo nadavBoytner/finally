@@ -12,8 +12,6 @@ from app.market_data.massive_provider import (
     parse_snapshot,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 def snap(ticker, price=None, day_close=None, change=1.5):
     return SimpleNamespace(
@@ -40,16 +38,6 @@ class FakeClient:
         if self.error:
             raise self.error
         return next((s for s in self.snapshots if s.ticker == ticker), None)
-
-
-class RateLimited(Exception):
-    status_code = 429
-    response = SimpleNamespace(headers={"Retry-After": "2"})
-
-
-class RateLimitedNoRetryAfter(Exception):
-    status_code = 429
-    response = SimpleNamespace(headers={})
 
 
 # --- construction --------------------------------------------------------
@@ -112,9 +100,15 @@ def test_parse_never_raises_on_missing_sub_objects():
     assert parse_snapshot(bare) is None
 
 
-# --- run ---------------------------------------------------------------------
+# --- _fetch / run ------------------------------------------------------------
+#
+# The real `massive` SDK's own exceptions (`BadResponse`, `AuthError`) carry no
+# HTTP status or headers — see MARKET_DATA_REVIEW.md Finding 1 — so there is no
+# 429-specific path to test here. A poll failure is just logged and retried at
+# the normal cadence, which is what these tests verify.
 
 
+@pytest.mark.asyncio
 async def test_run_requests_exactly_the_tracked_set():
     client = FakeClient([snap("AAPL", price=190.0), snap("MSFT", price=420.0)])
     provider = MassiveProvider("k", poll_seconds=0.01, client=client)
@@ -130,6 +124,7 @@ async def test_run_requests_exactly_the_tracked_set():
     assert cache.get("AAPL").price == 190.0
 
 
+@pytest.mark.asyncio
 async def test_run_skips_the_fetch_when_nothing_is_tracked():
     client = FakeClient([])
     provider = MassiveProvider("k", poll_seconds=0.01, client=client)
@@ -143,6 +138,7 @@ async def test_run_skips_the_fetch_when_nothing_is_tracked():
     assert client.calls == []
 
 
+@pytest.mark.asyncio
 async def test_run_survives_a_poll_failure():
     client = FakeClient(error=RuntimeError("boom"))
     provider = MassiveProvider("k", poll_seconds=0.01, client=client)
@@ -158,91 +154,63 @@ async def test_run_survives_a_poll_failure():
     assert len(client.calls) > 1  # and it must keep retrying
 
 
-async def test_run_honors_retry_after_on_429():
-    client = FakeClient(error=RateLimited())
-    provider = MassiveProvider("k", poll_seconds=0.01, client=client)
-
-    task = asyncio.create_task(provider.run(PriceCache(), lambda: {"AAPL"}))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert len(client.calls) == 1  # backed off 2s, so no second attempt yet
+@pytest.mark.asyncio
+async def test_fetch_logs_and_returns_no_rows_on_failure_without_raising():
+    client = FakeClient(error=RuntimeError("boom"))
+    provider = MassiveProvider("k", client=client)
+    assert await provider._fetch(["AAPL"]) == []
 
 
-async def test_run_backs_off_without_retry_after_and_keeps_retrying():
-    client = FakeClient(error=RateLimitedNoRetryAfter())
-    provider = MassiveProvider("k", poll_seconds=0.01, client=client)
-
-    task = asyncio.create_task(provider.run(PriceCache(), lambda: {"AAPL"}))
-    await asyncio.sleep(0.1)
-    still_running = not task.done()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # No Retry-After header: falls back to the growing backoff, but the loop
-    # must never die and must eventually retry again.
-    assert still_running
-    assert len(client.calls) >= 1
-
-
-class QuickRateLimited(Exception):
-    status_code = 429
-    response = SimpleNamespace(headers={"Retry-After": "0.05"})
-
-
-class FlakyThenHealthyClient(FakeClient):
-    """Rate-limited for the first N calls, then serves normally — used to
-    verify backoff resets to the fast cadence after a success."""
-
-    def __init__(self, snapshots, fail_calls: int):
-        super().__init__(snapshots)
-        self._fail_calls = fail_calls
+class SecondChunkFails(FakeClient):
+    """Serves the first chunk normally but raises on any later chunk — used
+    to verify a failed chunk doesn't discard rows already parsed from an
+    earlier, successful one."""
 
     def get_snapshot_all(self, market, tickers):
         self.calls.append(list(tickers))
-        if len(self.calls) <= self._fail_calls:
-            raise QuickRateLimited()
-        return self.snapshots
+        if tickers == ["MSFT"]:
+            raise RuntimeError("boom")
+        return [s for s in self.snapshots if s.ticker in tickers]
 
 
-async def test_run_resets_backoff_after_a_success():
-    client = FlakyThenHealthyClient([snap("AAPL", price=190.0)], fail_calls=1)
-    provider = MassiveProvider("k", poll_seconds=0.01, client=client)
+@pytest.mark.asyncio
+async def test_fetch_keeps_earlier_chunks_when_a_later_chunk_fails(monkeypatch):
+    # Force one ticker per chunk so AAPL and MSFT land in separate requests.
+    monkeypatch.setattr(
+        "app.market_data.massive_provider.MAX_TICKERS_PER_REQUEST", 1
+    )
+    client = SecondChunkFails([snap("AAPL", price=190.0)])
+    provider = MassiveProvider("k", client=client)
 
-    task = asyncio.create_task(provider.run(PriceCache(), lambda: {"AAPL"}))
-    # First call is rate-limited (short Retry-After); a naive implementation
-    # that never resets backoff would stay slow forever after. Give it enough
-    # time to pass the recovered call and resume the fast, poll_seconds cadence.
-    await asyncio.sleep(0.15)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    rows = await provider._fetch(["AAPL", "MSFT"])
 
-    assert len(client.calls) >= 3  # 1 failure + at least 2 fast follow-up polls
+    assert rows == [("AAPL", 190.0, 1.5)]   # AAPL's chunk survives MSFT's failure
+    assert len(client.calls) == 2           # both chunks were attempted
 
 
 # --- startup_check / prime ---------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_startup_check_raises_plan_error_on_failure():
     provider = MassiveProvider("k", client=FakeClient(error=RuntimeError("403")))
     with pytest.raises(MassivePlanError):
         await provider.startup_check()
 
 
+@pytest.mark.asyncio
 async def test_startup_check_succeeds_with_a_working_client():
     provider = MassiveProvider("k", client=FakeClient([snap("AAPL", price=1.0)]))
     await provider.startup_check()  # must not raise
 
 
+@pytest.mark.asyncio
 async def test_prime_returns_none_for_an_unknown_symbol():
     provider = MassiveProvider("k", client=FakeClient([]))
     assert await provider.prime(PriceCache(), "NOPE") is None
 
 
+@pytest.mark.asyncio
 async def test_prime_writes_the_resolved_price_into_the_cache():
     provider = MassiveProvider("k", client=FakeClient([snap("AAPL", price=190.0)]))
     cache = PriceCache()
@@ -253,6 +221,7 @@ async def test_prime_writes_the_resolved_price_into_the_cache():
     assert cache.get("AAPL").price == 190.0
 
 
+@pytest.mark.asyncio
 async def test_prime_returns_none_on_client_error():
     provider = MassiveProvider("k", client=FakeClient(error=RuntimeError("network")))
     assert await provider.prime(PriceCache(), "AAPL") is None

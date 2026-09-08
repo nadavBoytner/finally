@@ -80,3 +80,22 @@ def test_returned_set_is_a_copy_and_cannot_mutate_the_memo(db):
     result = tracked()
     result.add("BOGUS")
     assert "BOGUS" not in tracked()
+
+
+def test_connect_is_called_at_most_once(db):
+    """Regression for MARKET_DATA_REVIEW.md Finding 2: `sqlite3.Connection`'s
+    context manager only commits/rolls back, it never closes. If `connect()`
+    opened a fresh connection on every call (as a real per-request factory
+    would), a TTL this short would leak one roughly every tick. TrackedTickers
+    must call `connect()` at most once and reuse that connection forever."""
+    calls = []
+
+    def connect():
+        calls.append(1)
+        return db
+
+    tracked = TrackedTickers(connect, ttl=0.0)  # TTL 0 forces a refetch every call
+    tracked()
+    tracked()
+    tracked()
+    assert calls == [1]

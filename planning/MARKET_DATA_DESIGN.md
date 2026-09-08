@@ -548,31 +548,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_SECONDS = 15.0
 MAX_TICKERS_PER_REQUEST = 100  # keeps the ?tickers= query string well under URL limits
-MAX_BACKOFF_SECONDS = 120.0
 
 
 class MassivePlanError(RuntimeError):
     """The key cannot reach snapshot data — bad key, or a free-tier plan."""
-
-
-def _status_code(exc: BaseException) -> int | None:
-    """Best-effort HTTP status extraction; the client wraps httpx errors."""
-    for attr in ("status", "status_code"):
-        code = getattr(exc, attr, None)
-        if isinstance(code, int):
-            return code
-    response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
-    return code if isinstance(code, int) else None
-
-
-def _retry_after(exc: BaseException) -> float | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) or {}
-    try:
-        return float(headers.get("Retry-After"))
-    except (TypeError, ValueError):
-        return None
 
 
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
@@ -646,11 +625,22 @@ class MassiveProvider(MarketDataProvider):
             ) from exc
 
     async def _fetch(self, tickers: Sequence[str]) -> list[Row]:
+        """Fetch every chunk, keeping rows already parsed even if a later
+        chunk fails (see §12.10: a failed chunk is logged and skipped, not
+        allowed to discard chunks that already succeeded)."""
         rows: list[Row] = []
         for chunk in _chunks(tickers, MAX_TICKERS_PER_REQUEST):
-            snaps = await asyncio.to_thread(
-                self._client.get_snapshot_all, "stocks", tickers=list(chunk)
-            )
+            try:
+                snaps = await asyncio.to_thread(
+                    self._client.get_snapshot_all, "stocks", tickers=list(chunk)
+                )
+            except Exception:
+                logger.warning(
+                    "Massive snapshot request failed for %d ticker(s); skipping",
+                    len(chunk),
+                    exc_info=True,
+                )
+                continue
             for snap in snaps or ():
                 row = parse_snapshot(snap)
                 if row is not None:
@@ -658,32 +648,12 @@ class MassiveProvider(MarketDataProvider):
         return rows
 
     async def run(self, cache: PriceCache, tracked: Tracked) -> None:
-        backoff = 0.0
         while True:
             tickers = sorted(tracked())
-            if not tickers:
-                await asyncio.sleep(self._poll_seconds)
-                continue
-
-            try:
+            if tickers:
                 rows = await self._fetch(tickers)
-            except Exception as exc:
-                if _status_code(exc) == 429:
-                    wait = _retry_after(exc)
-                    if wait is None:
-                        backoff = min(
-                            max(backoff * 2.0, self._poll_seconds), MAX_BACKOFF_SECONDS
-                        )
-                        wait = backoff
-                    logger.warning("Massive rate-limited (429); backing off %.1fs", wait)
-                    await asyncio.sleep(wait)
-                    continue
-                logger.warning("Massive poll failed; retrying next cycle", exc_info=True)
-            else:
-                backoff = 0.0
                 if rows:
                     await cache.update_many(rows)
-
             await asyncio.sleep(self._poll_seconds)
 
     async def prime(self, cache: PriceCache, ticker: str) -> PriceTick | None:
@@ -708,8 +678,8 @@ Design notes:
 
 - **`asyncio.to_thread` on every client call.** `RESTClient` is synchronous and blocking. Calling it directly on the event loop would freeze *every* connected SSE stream for the duration of the HTTP round trip — a 300ms API call would stall every browser's price feed. Offloading to a thread keeps the loop free.
 - **The lazy `from massive import RESTClient`.** Keeping it inside `__init__` means `factory.py` and `main.py` can import this module unconditionally without requiring the SDK to be importable in simulator mode, and tests can construct the provider with a fake client and never touch the real package.
-- **429 gets its own branch.** `MASSIVE_API.md` §5 documents `429` with an optional `Retry-After`. Honoring the header when present, and otherwise doubling from the poll interval up to a 2-minute ceiling, prevents a rate-limited client from hammering the API on every cycle. `backoff` resets to zero after any success, so one bad minute does not leave the stream permanently slow. Non-429 errors just log and retry on the normal cadence — a transient network blip should not throttle the feed.
-- **A failed poll never kills the loop.** The `try` wraps only `_fetch`; the `while True` continues regardless. Massive is optional, so a broken data source must degrade to stale prices, never to a dead app.
+- **No 429-specific handling.** `MASSIVE_API.md` §5 documents `429` with an optional `Retry-After`, and an earlier revision of this code tried to detect it via `getattr(exc, "status_code", None)` / `getattr(exc, "response", None)`. §12.10 explains why that never worked: the actual `massive` client's exceptions (`BadResponse`, `AuthError`) carry neither attribute, so the branch was dead code that only its own mocked tests exercised. Every poll failure — 429 included — is now handled uniformly: logged and retried at the normal `poll_seconds` cadence. The SDK's own `urllib3.Retry` already retries 429/5xx a few times internally before raising, so this isn't unprotected; it just isn't tunable from here.
+- **A failed chunk never kills the loop, and never discards a sibling chunk's data.** Each chunk's `get_snapshot_all` call is individually wrapped in `try`/`except` inside `_fetch` — a failure there is logged and skipped, and `_fetch` moves on to the next chunk rather than raising and losing rows already parsed from an earlier one. Massive is optional, so a broken data source must degrade to stale prices, never to a dead app.
 - **Chunking at 100 tickers.** The watchlist ∪ positions set will realistically be far smaller, but `?tickers=` is a query string, and unbounded growth is the kind of thing that fails only in the demo.
 - **`poll_seconds` is configuration, not auto-detection.** Defaulting to 15s per `PLAN.md` §6 and overridable via `MASSIVE_POLL_SECONDS`. Detecting the plan tier would require parsing undocumented account metadata; a documented env var the student sets once is simpler and honest. `MASSIVE_API.md` §6 notes 15s suits Starter/Developer (15-minute-delayed data does not get fresher when polled faster) while Advanced can justify 2–5s.
 
@@ -752,17 +722,26 @@ class TrackedTickers:
         ttl: float = 1.0,
     ) -> None:
         self._connect = connect
+        self._conn: sqlite3.Connection | None = None
         self._user_id = user_id
         self._ttl = ttl
         self._cached: set[str] = set()
         self._fetched_at: float | None = None
 
+    def _connection(self) -> sqlite3.Connection:
+        """`connect()` is called at most once per instance and the connection
+        is held for the process lifetime — see §12.11."""
+        if self._conn is None:
+            self._conn = self._connect()
+        return self._conn
+
     def __call__(self) -> set[str]:
         now = time.monotonic()
         if self._fetched_at is not None and now - self._fetched_at < self._ttl:
             return set(self._cached)
-        with self._connect() as conn:
-            rows = conn.execute(TRACKED_SQL, (self._user_id, self._user_id)).fetchall()
+        rows = self._connection().execute(
+            TRACKED_SQL, (self._user_id, self._user_id)
+        ).fetchall()
         self._cached = {str(row[0]).upper() for row in rows}
         self._fetched_at = now
         return set(self._cached)
@@ -776,6 +755,7 @@ class TrackedTickers:
 - **Why memoize.** At `TICK_SECONDS = 0.5` this is called twice a second for the life of the process. The query is trivially fast on a table of ~10 rows, but running it 172,800 times a day to get the same answer is noise in the logs and in the profile. A 1s TTL caps it at ~1 query/sec.
 - **Why `invalidate()` rather than a shorter TTL.** Without it, a ticker added to the watchlist could take up to a full second to start streaming, which is visible as a blank row. The watchlist and trade handlers call `invalidate()` after committing, so the very next tick includes the new symbol. The TTL is then only a backstop for changes made outside those handlers (someone editing the SQLite file by hand).
 - **Returning a copy** (`set(self._cached)`) prevents a provider from mutating the memo. Cheap at this size, and it removes a whole class of aliasing bug.
+- **`connect()` is called at most once, ever, per `TrackedTickers` instance.** `sqlite3.Connection.__exit__` only commits or rolls back a transaction — it never closes the connection — so a naive `with self._connect() as conn:` on every cache-miss would open (and never close) a fresh connection roughly once a second if `connect` is a per-call factory, which is the natural way to implement it for a request-scoped app. Caching the connection in `_connection()` makes that leak impossible regardless of how `connect` is implemented downstream. See §12.11.
 
 ### 7.2 `factory.py`
 
@@ -1344,11 +1324,6 @@ class FakeClient:
         return next((s for s in self.snapshots if s.ticker == ticker), None)
 
 
-class RateLimited(Exception):
-    status_code = 429
-    response = SimpleNamespace(headers={"Retry-After": "2"})
-
-
 # --- parsing -----------------------------------------------------------------
 
 def test_parse_prefers_last_trade_then_falls_back_to_day_close():
@@ -1394,15 +1369,10 @@ async def test_run_survives_a_poll_failure():
     assert len(client.calls) > 1  # and it must keep retrying
 
 
-async def test_run_honors_retry_after_on_429():
-    client = FakeClient(error=RateLimited())
-    provider = MassiveProvider("k", poll_seconds=0.01, client=client)
-
-    task = asyncio.create_task(provider.run(PriceCache(), lambda: {"AAPL"}))
-    await asyncio.sleep(0.05)
-    task.cancel()
-
-    assert len(client.calls) == 1  # backed off 2s, so no second attempt yet
+# No 429-specific test: the real `massive` client's exceptions (`BadResponse`,
+# `AuthError`) carry no status code or headers to detect one with — see §12.10.
+# `test_run_survives_a_poll_failure` above already covers "any poll failure,
+# 429 included, must not kill the loop."
 
 
 # --- startup_check / prime ---------------------------------------------------
@@ -1589,6 +1559,10 @@ The code above is written correct. These are the places it knowingly departs fro
 **12.8 — `429` had no distinct handling.** `MASSIVE_API.md` §5 documents `429` with an optional `Retry-After`, but `MARKET_INTERFACE.md`'s `run` catches every exception identically and sleeps the normal interval — which re-hits a rate-limited endpoint immediately. [§6.3](#63-the-provider) gives it a backoff branch honoring the header.
 
 **12.9 — Per-ticker cache writes became one batch.** The earlier `run` awaits `cache.update()` once per ticker, so an SSE `snapshot()` between two writes observes half a tick and the ticks in one tick carry different timestamps. `update_many` ([§4](#4-cachepy--pricecache)) applies a tick atomically under one timestamp.
+
+**12.10 — The 429 backoff in §6.3 never actually detects a 429.** This was found during `MARKET_DATA_REVIEW.md`'s code review by checking the actually-installed `massive` 2.8.0 package, not just `MASSIVE_API.md`'s description of it. `_status_code`/`_retry_after` read `getattr(exc, "status_code", None)` and `getattr(exc, "response", None)`, but the real client (`massive/rest/base.py`) raises `BadResponse(resp.data.decode("utf-8"))` on any non-200 response — a bare `Exception` subclass carrying only the decoded response body as its message, no status code, no headers, no `response` attribute at all. So the `if _status_code(exc) == 429:` branch was unreachable against the real dependency; every real failure, 429 included, fell through to the generic `except Exception` path anyway. The tests that exercised the 429 branch (`test_run_honors_retry_after_on_429` and friends, in the original `tests/test_massive_provider.py`) passed only because they constructed synthetic exceptions with a `status_code`/`response` shape the real SDK never produces — green tests validating a contract that didn't hold. §6.3 above now reflects the fix: `_status_code`, `_retry_after`, and the whole branch were removed rather than patched, since there is no reliable way to recover a status code from `BadResponse` (its message is the raw response body, not structured data) and the generic fallback — log and retry at `poll_seconds` — was already safe. The SDK's own `urllib3.Retry` strategy already retries 429/5xx a few times internally before raising, so this isn't unprotected, just not tunable from here.
+
+**12.11 — `TrackedTickers` could leak a connection roughly once a second.** `with self._connect() as conn:` relies on `sqlite3.Connection.__exit__` to clean up, but that only commits or rolls back the transaction — it never closes the connection. That's invisible with a shared long-lived connection (as `tests/conftest.py`'s fixture provides), but §7.3's lifespan passes the bare `connect` function, and every convention in this codebase implies `connect()` opens a **new** connection per call. Since `TrackedTickers.__call__` runs on a 1-second TTL for the life of the process, that would open a never-explicitly-closed connection roughly once a second for as long as the container runs. §7.1 above now caches the connection in `_connection()` on first use and reuses it for the instance's lifetime, so `connect()` is called at most once regardless of how it's implemented — this doesn't depend on the (not-yet-written) db layer getting its contract right.
 
 ---
 

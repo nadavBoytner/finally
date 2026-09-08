@@ -1,5 +1,9 @@
 # Market Data Backend — Code Review
 
+**Update:** All five findings below have been addressed — see the "Fixes applied" section
+at the end. All 64 tests still pass (0 warnings, down from 10). The analysis is left as
+originally written since it's still the accurate record of what was found and why.
+
 Review of `backend/app/market_data/` against its governing design docs
 (`MARKET_DATA_DESIGN.md`, `MARKET_INTERFACE.md`, `MARKET_SIMULATOR.md`, `MASSIVE_API.md`)
 and `PLAN.md` §5–6. Scope: `models.py`, `interface.py`, `cache.py`, `simulator.py`,
@@ -50,7 +54,7 @@ Finding 3 below) — nothing failed.
 
 ## Findings
 
-### 1. (High) The Massive-provider 429 backoff path is dead code against the real SDK
+### 1. (High) The Massive-provider 429 backoff path is dead code against the real SDK — **Fixed**
 
 `massive_provider.py`'s `_status_code()` and `_retry_after()` extract a status code and
 `Retry-After` header from a caught exception via `getattr(exc, "status", None)`,
@@ -101,7 +105,7 @@ I'd lean toward the third option — the generic fallback is already safe, and t
 code adds real complexity (backoff state, `_status_code`, `_retry_after`, three tests) for a
 path that can't currently be reached.
 
-### 2. (Medium, forward-looking) `TrackedTickers` never closes the connection it opens
+### 2. (Medium, forward-looking) `TrackedTickers` never closes the connection it opens — **Fixed**
 
 `tracking.py`:
 
@@ -129,7 +133,7 @@ layer is built: either `connect()` should return a shared/pooled connection, or
 `TrackedTickers` should own the close (`try: ... finally: conn.close()`, or
 `contextlib.closing`).
 
-### 3. (Low) Ten `PytestWarning`s from a misapplied module-level marker
+### 3. (Low) Ten `PytestWarning`s from a misapplied module-level marker — **Fixed**
 
 `test_massive_provider.py` sets `pytestmark = pytest.mark.asyncio` once at module scope,
 but roughly a third of the tests in that file (`test_poll_seconds_defaults_when_not_given`,
@@ -139,7 +143,7 @@ run — though nothing fails. Cleanest fix: drop the module-level `pytestmark` a
 the `async def` tests individually (or split the file into sync-parsing vs. async-run
 sections, each with its own marker scope).
 
-### 4. (Low) A partial chunk failure in `MassiveProvider._fetch` discards already-fetched rows
+### 4. (Low) A partial chunk failure in `MassiveProvider._fetch` discards already-fetched rows — **Fixed**
 
 When the tracked set exceeds `MAX_TICKERS_PER_REQUEST` (100), `_fetch` loops over chunks and
 awaits each `get_snapshot_all` in turn. If chunk 2 of 2 raises, the rows already parsed from
@@ -149,11 +153,48 @@ scale this is very unlikely to matter in practice (chunking only engages past 10
 symbols), but if it's worth fixing: accumulate rows across chunks and write what succeeded
 via `cache.update_many` even if a later chunk fails, instead of losing the whole cycle.
 
-### 5. (Info, not a defect) No lint or type-check config
+### 5. (Info, not a defect) No lint or type-check config — **not fixed, by design**
 
 There's no `ruff`/`mypy` config in `pyproject.toml` yet. Not a correctness issue — the code
 is consistently typed and styled by hand — just noting it's absent if the project wants CI
-gating on it later.
+gating on it later. Left alone: this finding was explicitly informational, and adding new
+tooling wasn't part of what the other four findings called for.
+
+## Fixes applied
+
+1. **Finding 1.** Removed `_status_code`, `_retry_after`, and `MAX_BACKOFF_SECONDS` from
+   `massive_provider.py`, along with the `if _status_code(exc) == 429:` branch in `run()` —
+   per the review's own recommended option, rather than trying to parse a status out of
+   `BadResponse`'s unstructured message text. `run()` now just logs and retries at
+   `poll_seconds` on any failure, which was already the safe fallback. Also folded in
+   Finding 4's fix here (see below), since both touch the same fetch path. Removed the three
+   tests that exercised the fake 429 contract (`test_run_honors_retry_after_on_429`,
+   `test_run_backs_off_without_retry_after_and_keeps_retrying`,
+   `test_run_resets_backoff_after_a_success`) and their synthetic exception classes.
+2. **Finding 2.** `TrackedTickers` now caches the connection from `connect()` in
+   `_connection()` on first use instead of calling `self._connect()` inside `with ... as conn:`
+   on every cache miss. `connect()` is now called at most once per instance, for the life of
+   the process, regardless of whether it returns a shared connection or opens a fresh one —
+   closing off the leak risk without needing to assume anything about the future db layer.
+   Added `test_connect_is_called_at_most_once` as a regression test.
+3. **Finding 3.** Removed the module-level `pytestmark = pytest.mark.asyncio` in
+   `test_massive_provider.py` and added `@pytest.mark.asyncio` to each of the actually-async
+   test functions individually. 0 warnings now (down from 10).
+4. **Finding 4.** `MassiveProvider._fetch` now wraps each chunk's `get_snapshot_all` call in
+   its own `try`/`except`: a failed chunk is logged and skipped, and rows already parsed from
+   an earlier successful chunk are kept and still written to the cache. Added
+   `test_fetch_keeps_earlier_chunks_when_a_later_chunk_fails` and
+   `test_fetch_logs_and_returns_no_rows_on_failure_without_raising`.
+5. **Finding 5.** Left as-is (see above).
+
+`MARKET_DATA_DESIGN.md` was updated alongside the code (§6.2, §6.3, §7.1, §11.3, and two new
+correction entries, §12.10 and §12.11) so the design doc doesn't contradict what's actually
+implemented — consistent with how it already documents its own history of corrections in §12.
+
+```
+uv run pytest -v
+64 passed in 0.55s
+```
 
 ## Verdict
 
@@ -163,13 +204,15 @@ fixes actually landed and regression-tested in the code. All 64 tests pass, the 
 math checks out (verified independently, not just "tests pass"), and the Massive
 integration was checked against the real installed SDK rather than taken on faith.
 
-The one real bug (**Finding 1**) is that the Massive-provider's rate-limit-specific backoff
-never activates against the real `massive` client, because that client's exceptions don't
+The one real bug (**Finding 1**) was that the Massive-provider's rate-limit-specific backoff
+never activated against the real `massive` client, because that client's exceptions don't
 carry the `status_code`/`response` shape the code (and its tests, via synthetic exception
-classes) assume. It degrades safely rather than crashing, but it's dead code that
-its own test suite doesn't actually catch, because the tests mock a contract the dependency
-doesn't implement. Worth a decision — fix the detection, or drop the special-cased path —
-before treating Massive-mode resilience as covered.
+classes) assumed — dead code that its own test suite didn't catch, because the tests mocked
+a contract the dependency doesn't implement. It's now removed rather than patched, in favor
+of the generic retry-at-cadence fallback that was already safe.
 
-**Finding 2** is a heads-up for whoever writes `backend/app/db.py` next, not a bug in this
-package.
+**Finding 2** was a heads-up for whoever writes `backend/app/db.py` next rather than a bug
+in the code that existed — it's now closed off regardless of how that layer gets built.
+
+All four actionable findings are fixed; the package is ready as the foundation for the
+`main.py` / `api/stream.py` / `api/portfolio.py` work that builds on it next.
