@@ -6,13 +6,16 @@ FastAPI app with the simulator provider.
 
 from __future__ import annotations
 
+import time
+
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import db
 from app.api._tickers import normalize_ticker
 from app.api.pricing import resolve_price, resolve_tick
+from app.api.stream import stream_prices
 from app.market_data import PriceCache
 
 
@@ -62,24 +65,42 @@ def test_lifespan_exposes_state_for_the_routes(app_client):
 
 
 def test_background_task_updates_prices(app_client):
-    """The provider loop is actually running, not merely constructed."""
+    """The provider loop is actually running, not merely constructed.
+
+    TestClient runs the event loop in its own portal thread, so sleeping here
+    lets the simulator tick. Spinning on requests instead would never let the
+    0.5s tick interval elapse.
+    """
     cache = app_client.app.state.price_cache
     before = cache.get("AAPL")
-    for _ in range(60):  # up to ~3s at the 0.5s tick
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
         if cache.get("AAPL").timestamp != before.timestamp:
             break
-        app_client.get("/api/health")  # yields to the event loop
+        time.sleep(0.05)
     assert cache.get("AAPL").timestamp != before.timestamp
 
 
 # --- SSE response headers (§8) -----------------------------------------------
 
-def test_stream_sets_sse_headers(app_client):
-    with app_client.stream("GET", "/api/stream/prices") as response:
-        assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/event-stream")
+@pytest.mark.asyncio
+async def test_stream_sets_sse_headers(app_client):
+    """Assert on the response the route builds, without iterating its body.
+
+    Deliberately not `TestClient.stream(...)`: the body is an infinite
+    generator, so leaving the context manager blocks forever trying to drain
+    it. Streaming behavior itself is covered in test_stream.py, which drives
+    the generator directly.
+    """
+    request = _request_for(app_client)
+    response = await stream_prices(request)
+    try:
+        assert response.media_type == "text/event-stream"
         assert "no-cache" in response.headers["cache-control"]
         assert response.headers["x-accel-buffering"] == "no"
+        assert response.headers["connection"] == "keep-alive"
+    finally:
+        await response.body_iterator.aclose()
 
 
 # --- price resolution on the trade path (§9.2) -------------------------------
