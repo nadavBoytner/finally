@@ -1,0 +1,22 @@
+[project]
+name = "finally-backend"
+version = "0.1.0"
+description = "FinAlly backend — FastAPI trading workstation API"
+requires-python = ">=3.12"
+dependencies = [
+    "massive>=0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "strict"
