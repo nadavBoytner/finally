@@ -57,7 +57,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 │  └── /*              Static file serving         │
 │                      (Next.js export)            │
 │                                                 │
-│  SQLite database (volume-mounted)               │
+│  SQLite database (bind-mounted)                 │
 │  Background task: market data polling/sim        │
 └─────────────────────────────────────────────────┘
 ```
@@ -76,7 +76,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 | SSE over WebSockets | One-way push is all we need; simpler, no bidirectional complexity, universal browser support |
 | Static Next.js export | Single origin, no CORS issues, one port, one container, simple deployment |
 | SQLite over Postgres | No auth = no multi-user = no need for a database server; self-contained, zero config |
-| Single Docker container | Students run one command; no docker-compose for production, no service orchestration |
+| Single Docker container | Students run one command; `docker-compose.yml` here is a single-service convenience wrapper around that one container, not multi-service orchestration |
 | uv for Python | Fast, modern Python project management; reproducible lockfile; what students should learn |
 | Market orders only | Eliminates order book, limit order logic, partial fills — dramatically simpler portfolio math |
 
@@ -93,16 +93,17 @@ finally/
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
 ├── scripts/
-│   ├── start_mac.sh          # Launch Docker container (macOS/Linux)
-│   ├── stop_mac.sh           # Stop Docker container (macOS/Linux)
-│   ├── start_windows.ps1     # Launch Docker container (Windows PowerShell)
-│   └── stop_windows.ps1      # Stop Docker container (Windows PowerShell)
+│   ├── start_mac.sh          # Thin wrapper: docker compose up -d (macOS/Linux)
+│   ├── stop_mac.sh           # Thin wrapper: docker compose down (macOS/Linux)
+│   ├── start_windows.ps1     # Thin wrapper: docker compose up -d (Windows PowerShell)
+│   └── stop_windows.ps1      # Thin wrapper: docker compose down (Windows PowerShell)
 ├── test/                     # Playwright E2E tests + docker-compose.test.yml
-├── db/                       # Volume mount target (SQLite file lives here at runtime)
+├── db/                       # Bind-mounted at runtime; SQLite file lives here
 │   └── .gitkeep              # Directory exists in repo; finally.db is gitignored
 ├── Dockerfile                # Multi-stage build (Node → Python)
-├── docker-compose.yml        # Optional convenience wrapper
-├── .env                      # Environment variables (gitignored, .env.example committed)
+├── docker-compose.yml        # Source of truth for how the container runs (build, port, db/ bind mount, .env)
+├── .env                      # Environment variables (gitignored)
+├── .env.example               # Template committed to the repo
 └── .gitignore
 ```
 
@@ -111,10 +112,10 @@ finally/
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
 - **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
-- **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
+- **`db/`** at the top level is the runtime bind-mount point (see §11). The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
-- **`scripts/`** contains start/stop scripts that wrap Docker commands.
+- **`scripts/`** contains start/stop scripts that wrap `docker compose up -d` / `docker compose down` against the root `docker-compose.yml`. The compose file is the single source of truth for how the container runs (build, port mapping, `db/` bind mount, `.env` file); the scripts exist only for students who prefer a plain double-clickable script over typing compose commands.
 
 ---
 
@@ -139,6 +140,8 @@ LLM_MOCK=false
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
 
+**Priority**: the market simulator is the required data source for the course deliverable — build and validate it first. Massive integration is an optional stretch goal; don't block core portfolio/chat/UI work on it.
+
 ---
 
 ## 6. Market Data
@@ -151,10 +154,15 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Generates prices using geometric Brownian motion (GBM) with configurable drift and volatility per ticker
 - Updates at ~500ms intervals
-- Correlated moves across tickers (e.g., tech stocks move together)
+- A small shared market-wide random factor is added to every ticker's move each tick, so prices drift together without needing a sector/grouping table — simple correlation, no metadata to maintain
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
-- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
+- Starts from realistic seed prices for the 10 default tickers (e.g., AAPL ~$190, GOOGL ~$175, etc.)
 - Runs as an in-process background task — no external dependencies
+
+### New / Unlisted Tickers
+
+- No symbol validation against a real ticker list — any 1-5 character alphanumeric symbol is accepted (in simulator mode nothing else is possible; in Massive mode an invalid symbol simply returns no data and the ticker shows as unavailable)
+- If a ticker is added that has no predefined seed price (i.e., not one of the 10 defaults), the simulator derives one deterministically from a hash of the ticker symbol (e.g., mapped into a $20-$500 range) and assigns default drift/volatility, so simulation works for any symbol without manual configuration
 
 ### Massive API (Optional)
 
@@ -167,7 +175,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache holds the latest price, previous price, and timestamp for each ticker currently on the watchlist **or** held as an open position — the union of both, not just the watchlist. This keeps positions correctly priced even after a ticker is removed from the watchlist
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
@@ -175,7 +183,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
+- Server pushes price updates for every ticker currently in the price cache (watchlist ∪ open positions, per above) at a regular cadence (~500ms)
 - Each SSE event contains ticker, price, previous price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
@@ -211,7 +219,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
@@ -221,7 +229,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
+- `quantity` INTEGER (whole shares only)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
@@ -270,6 +278,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 ### Chat
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/chat/history` | Recent messages from `chat_messages`, used to rebuild the chat panel on page load |
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
 
 ### System
@@ -353,12 +362,12 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
 - **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
-- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
+- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist *or* the positions table selects it here (a held position stays chartable even after its ticker is removed from the watchlist, since the price cache keeps pricing it — see §6).
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
-- **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
+- **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change. Always shows every open position and its live price, regardless of watchlist membership — this is the one place a non-watchlisted holding remains visible
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
-- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
+- **AI chat panel** — docked/collapsible sidebar. On mount, fetches `GET /api/chat/history` to rebuild prior conversation; message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
 ### Technical Notes
@@ -368,6 +377,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
+- There is no historical price REST endpoint. Sparklines and the main chart show only data accumulated from the SSE stream since page load, so selecting a new ticker or reloading the page starts that chart empty and it fills in over time. This is intentional — it keeps price data to a single source (the live cache) instead of adding a second historical-data path
 
 ---
 
@@ -391,27 +401,26 @@ Stage 2: Python 3.12 slim
 
 FastAPI serves the static frontend files and all API routes on port 8000.
 
-### Docker Volume
+### Database Persistence (Bind Mount)
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a bind mount of the repo's `db/` directory — not a named Docker volume — so the `.db` file is directly visible/inspectable on the host and easy to reset (just delete it):
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v "$(pwd)/db:/app/db" -p 8000:8000 --env-file .env finally
 ```
 
-The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path. `docker-compose.yml` encodes this same mount so `docker compose up` and the raw `docker run` command stay equivalent.
 
 ### Start/Stop Scripts
 
 **`scripts/start_mac.sh`** (macOS/Linux):
-- Builds the Docker image if not already built (or if `--build` flag passed)
-- Runs the container with the volume mount, port mapping, and `.env` file
+- Runs `docker compose up -d --build`, which builds the image if needed and starts the container per `docker-compose.yml` (bind mount, port mapping, `.env` file)
 - Prints the URL to access the app
 - Optionally opens the browser
 
 **`scripts/stop_mac.sh`** (macOS/Linux):
-- Stops and removes the running container
-- Does NOT remove the volume (data persists)
+- Runs `docker compose down`
+- Does NOT delete `db/` (data persists on the host)
 
 **`scripts/start_windows.ps1`** / **`scripts/stop_windows.ps1`**: PowerShell equivalents for Windows.
 
@@ -454,3 +463,11 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes (Open Questions)
+
+*Added during a documentation review pass, with a second follow-up pass after a `/code-review` caught contradictions introduced by the first round of fixes. All clarifications and simplifications flagged across both passes (ticker/position price scoping, new-ticker seed prices, correlation model, fractional shares, chart backfill scope, Docker persistence and compose/script consistency, Massive priority, the docker-compose-vs-"no orchestration" rationale contradiction, bind-mount-vs-volume terminology, non-watchlisted-position chart access, and the missing chat-history endpoint) have since been incorporated directly into §§3-10 above. One item remains open — it's a product decision, not something to guess at:*
+
+- **Agent orchestration protocol is undefined.** The Vision section says the app is "built entirely by Coding Agents" coordinating "through files in `planning/`," and later sections refer to a "Frontend Engineer agent" and "Backend/Market Data agents" — but no section lists the agent roster, their responsibilities, how work is divided/handed off, or how conflicts (e.g., two agents editing the same interface contract) are resolved. For a course capstone whose whole point is demonstrating orchestration, this is the most load-bearing missing piece.
